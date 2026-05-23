@@ -7,6 +7,7 @@
 #include "mc_mini/tally.hpp"
 #include "mc_mini/scattering.hpp"
 #include "mc_mini/ace_loader.hpp"
+#include "mc_mini/timer.hpp"
 
 namespace mcm {
     Particle sample_source_particle(Rng& rng) {
@@ -80,9 +81,11 @@ namespace mcm {
 }
 
 int main() {
-    constexpr std::uint64_t particle_count = 1'000'000;
+    mcm::timer::record_start();
 
-    mcm::Rng rng(123);
+    constexpr std::uint64_t particle_count = 10'000'000;
+
+    mcm::Rng rng(12345);
 
     const mcm::Box box{
         .x_min = -5.0, .y_min = -5.0, .z_min = -5.0,
@@ -93,10 +96,14 @@ int main() {
 
     mcm::Tally tally{};
 
+    mcm::timer::record_initialization_end();
+
     for (std::uint64_t i = 0; i < particle_count; ++i) {
         mcm::Particle particle = mcm::sample_source_particle(rng);
         mcm::transport_history(particle, box, material, rng, tally);
     }
+
+    mcm::timer::record_transport_end();
 
     std::cout << "==== SIMULATION RESULTS =====" << std::endl << std::endl;
 
@@ -124,6 +131,8 @@ int main() {
     std::cout << "Cell volume: " << box.volume() << '\n';
     std::cout << "Track-length flux: " << tally.track_length_flux(particle_count, box.volume()) << std::endl;
     std::cout << std::endl;
+
+    mcm::timer::print_timing_results(particle_count);
 
     return 0;
 }

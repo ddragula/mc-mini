@@ -9,6 +9,7 @@
 #include <algorithm>
 
 #include "mc_mini/ace_loader.hpp"
+#include "mc_mini/timer.hpp"
 
 #define CUDA_CHECK(call)                                                                \
     do {                                                                                \
@@ -466,7 +467,9 @@ __global__ void process_collisions_kernel(
 }
 
 int main() {
-    constexpr std::size_t particle_count = 100'000'000;
+    mcm::timer::record_start();
+
+    constexpr std::size_t particle_count = 10'000'000;
     constexpr double source_energy = 2.0; // MeV
     const mcm::Material material = mcm::load_ace_material_from_mass_density("data/ace/C0.ACE", 2.26);
 
@@ -599,6 +602,8 @@ int main() {
     std::uint32_t iteration = 0;
     constexpr std::uint32_t max_iterations = 10000;
 
+    mcm::timer::record_initialization_end();
+
     while (active_count_host > 0 && iteration < max_iterations) {
         CUDA_CHECK(cudaMemset(escape_count, 0, sizeof(std::uint32_t)));
         CUDA_CHECK(cudaMemset(collision_count, 0, sizeof(std::uint32_t)));
@@ -697,6 +702,8 @@ int main() {
         ++iteration;
     }
 
+    mcm::timer::record_transport_end();
+
     std::cout << "iterations: " << iteration << '\n';
     std::cout << "active left: " << active_count_host << '\n';
     std::cout << "total escaped: " << total_escaped << '\n';
@@ -766,7 +773,9 @@ int main() {
     std::cout << "Cell volume: " << volume << '\n';
     std::cout << "Track-length flux: "
         << track_length_host / (static_cast<double>(particle_count) * volume)
-        << '\n';
+        << std::endl << std::endl;
+
+    mcm::timer::print_timing_results(particle_count);
 
     // === MEMORY CLEANUP ===
 
