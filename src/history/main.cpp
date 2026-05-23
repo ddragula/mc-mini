@@ -1,4 +1,5 @@
 #include <iostream>
+
 #include "mc_mini/geometry.hpp"
 #include "mc_mini/material.hpp"
 #include "mc_mini/particle.hpp"
