@@ -5,6 +5,7 @@ namespace mcm {
     struct Material {
         double xs_a{};
         double xs_s{};
+        double mass_number{1.0};
 
         [[nodiscard]] double xs_t() const noexcept {
             return xs_a + xs_s;

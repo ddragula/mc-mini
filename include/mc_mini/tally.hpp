@@ -9,6 +9,11 @@ namespace mcm {
         std::uint64_t escaped{};
         std::uint64_t collisions{};
 
+        double source_energy{};
+        double escaped_energy{};
+        double absorbed_energy{};
+        double recoil_energy{};
+
         [[nodiscard]] std::uint64_t total_particles() const noexcept {
             return absorbed + escaped;
         }
@@ -23,6 +28,10 @@ namespace mcm {
 
         [[nodiscard]] double mean_collisions() const noexcept {
             return static_cast<double>(collisions) / static_cast<double>(total_particles());
+        }
+
+        [[nodiscard]] double accounted_energy() const noexcept {
+            return escaped_energy + absorbed_energy + recoil_energy;
         }
     };
 
