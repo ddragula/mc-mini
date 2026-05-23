@@ -6,6 +6,8 @@
 #include <iostream>
 #include <vector>
 
+#include "mc_mini/ace_loader.hpp"
+
 #define CUDA_CHECK(call)                                                                \
     do {                                                                                \
         cudaError_t err = call;                                                         \
@@ -50,6 +52,21 @@ struct DeviceEventData {
     double* boundary_distance{};
 };
 
+struct DeviceXsTable {
+    double* energies{};
+    double* absorption{};
+    double* elastic{};
+
+    std::size_t size{};
+    double atom_density{};
+};
+
+struct DeviceCrossSections {
+    double a{};
+    double s{};
+    double t{};
+};
+
 __device__ double distance_to_boundary(
     DeviceParticles particles,
     std::uint32_t index,
@@ -76,6 +93,58 @@ __device__ double distance_to_boundary(
             : inf;
     
     return fmin(tx, fmin(ty, tz));
+}
+
+__device__ DeviceCrossSections lookup_cross_sections(
+    DeviceXsTable table,
+    double energy
+) {
+    if (energy <= table.energies[0]) {
+        const double a = table.absorption[0] * table.atom_density;
+        const double s = table.elastic[0] * table.atom_density;
+        
+        return DeviceCrossSections{a, s, a + s};
+    }
+
+    const std::size_t last = table.size - 1;
+
+    if (energy >= table.energies[last]) {
+        const double a = table.absorption[last] * table.atom_density;
+        const double s = table.elastic[last] * table.atom_density;
+
+        return DeviceCrossSections{a, s, a + s};
+    }
+
+    std::size_t left = 0;
+    std::size_t right = last;
+
+    while (right - left > 1) {
+        const std::size_t mid = left + (right - left) / 2;
+
+        if (table.energies[mid] > energy) {
+            right = mid;
+        } else {
+            left = mid;
+        }
+    }
+
+    const double e0 = table.energies[left];
+    const double e1 = table.energies[right];
+
+    const double t = (energy - e0) / (e1 - e0);
+
+    const double micro_a =
+        table.absorption[left] +
+        t * (table.absorption[right] - table.absorption[left]);
+
+    const double micro_s =
+        table.elastic[left] +
+        t * (table.elastic[right] - table.elastic[left]);
+    
+    const double a = micro_a * table.atom_density;
+    const double s = micro_s * table.atom_density;
+
+    return DeviceCrossSections{a, s, a + s};
 }
 
 __global__ void initialize_particles_kernel(
@@ -110,6 +179,7 @@ __global__ void initialize_particles_kernel(
 __global__ void classify_events_kernel(
     DeviceParticles particles,
     DeviceEventData event_data,
+    DeviceXsTable xs_table,
     std::uint32_t* active_queue,
     std::size_t active_count,
     std::uint32_t* escape_queue,
@@ -127,7 +197,9 @@ __global__ void classify_events_kernel(
     const std::uint32_t particle_index = active_queue[slot];
 
     const double boundary_distance = distance_to_boundary(particles, particle_index, box);
-    const double collision_distance = particle_index % 2 == 0 ? 3.0 : 7.0; // Placeholder for now. (TODO)
+
+    const DeviceCrossSections xs = lookup_cross_sections(xs_table, particles.energy[particle_index]);
+    const double collision_distance = (particle_index % 2 == 0 ? 0.5 : 2.5) / xs.t; // Placeholder for stochastic collision distance sampling.
 
     event_data.boundary_distance[particle_index] = boundary_distance;
     event_data.collision_distance[particle_index] = collision_distance;
@@ -193,6 +265,37 @@ int main() {
     constexpr std::size_t particle_count = 1'000'000;
     constexpr double source_energy = 2.0; // MeV
 
+    const mcm::Material material = mcm::load_ace_material_from_mass_density("data/ace/C0.ACE", 2.26);
+
+    DeviceXsTable xs_table{};
+    xs_table.size = material.micro_xs.energies.size();
+    xs_table.atom_density = material.atom_density;
+
+    CUDA_CHECK(cudaMalloc(&xs_table.energies, xs_table.size * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&xs_table.absorption, xs_table.size * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&xs_table.elastic, xs_table.size * sizeof(double)));
+
+    CUDA_CHECK(cudaMemcpy(
+        xs_table.energies,
+        material.micro_xs.energies.data(),
+        xs_table.size * sizeof(double),
+        cudaMemcpyHostToDevice
+    ));
+
+    CUDA_CHECK(cudaMemcpy(
+        xs_table.absorption,
+        material.micro_xs.absorption.data(),
+        xs_table.size * sizeof(double),
+        cudaMemcpyHostToDevice
+    ));
+
+    CUDA_CHECK(cudaMemcpy(
+        xs_table.elastic,
+        material.micro_xs.elastic.data(),
+        xs_table.size * sizeof(double),
+        cudaMemcpyHostToDevice
+    ));
+
     DeviceParticles particles{};
     DeviceEventData event_data{};
 
@@ -250,6 +353,7 @@ int main() {
     classify_events_kernel<<<blocks, threads_per_block>>>(
         particles,
         event_data,
+        xs_table,
         active_queue,
         particle_count,
         escape_queue,
@@ -367,6 +471,9 @@ int main() {
     CUDA_CHECK(cudaFree(collision_count));
     CUDA_CHECK(cudaFree(event_data.collision_distance));
     CUDA_CHECK(cudaFree(event_data.boundary_distance));
+    CUDA_CHECK(cudaFree(xs_table.energies));
+    CUDA_CHECK(cudaFree(xs_table.absorption));
+    CUDA_CHECK(cudaFree(xs_table.elastic));
 
     return 0;
 }
