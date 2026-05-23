@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <iostream>
 #include <vector>
+#include <algorithm>
 
 #include "mc_mini/ace_loader.hpp"
 
@@ -521,6 +522,7 @@ int main() {
     CUDA_CHECK(cudaMalloc(&collision_count, sizeof(std::uint32_t)));
     CUDA_CHECK(cudaMalloc(&next_active_count, sizeof(std::uint32_t)));
 
+    // TODO: check if can be removed from here since they are also reset at the beginning of each iteration
     CUDA_CHECK(cudaMemset(escape_count, 0, sizeof(std::uint32_t)));
     CUDA_CHECK(cudaMemset(collision_count, 0, sizeof(std::uint32_t)));
     CUDA_CHECK(cudaMemset(next_active_count, 0, sizeof(std::uint32_t)));
@@ -559,139 +561,119 @@ int main() {
         .z_max = 5.0
     };
 
-    classify_events_kernel<<<blocks, threads_per_block>>>(
-        particles,
-        event_data,
-        xs_table,
-        rng_states,
-        active_queue,
-        particle_count,
-        escape_queue,
-        escape_count,
-        collision_queue,
-        collision_count,
-        box
-    );
+    std::uint32_t active_count_host = static_cast<std::uint32_t>(particle_count);
 
-    CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaDeviceSynchronize());
+    std::uint64_t total_escaped = 0;
+    std::uint64_t total_absorbed = 0;
+    std::uint64_t total_collisions = 0;
 
-    std::uint32_t escape_count_host{};
-    std::uint32_t collision_count_host{};
+    std::uint32_t iteration = 0;
+    constexpr std::uint32_t max_iterations = 10000;
 
-    CUDA_CHECK(cudaMemcpy(
-        &escape_count_host,
-        escape_count,
-        sizeof(std::uint32_t),
-        cudaMemcpyDeviceToHost
-    ));
+    while (active_count_host > 0 && iteration < max_iterations) {
+        CUDA_CHECK(cudaMemset(escape_count, 0, sizeof(std::uint32_t)));
+        CUDA_CHECK(cudaMemset(collision_count, 0, sizeof(std::uint32_t)));
+        CUDA_CHECK(cudaMemset(next_active_count, 0, sizeof(std::uint32_t)));
 
-    CUDA_CHECK(cudaMemcpy(
-        &collision_count_host,
-        collision_count,
-        sizeof(std::uint32_t),
-        cudaMemcpyDeviceToHost
-    ));
+        const int active_blocks = static_cast<int>(
+            (active_count_host + threads_per_block - 1) / threads_per_block
+        );
 
-    const int escape_blocks = static_cast<int>(
-        (escape_count_host + threads_per_block - 1) / threads_per_block
-    );
+        classify_events_kernel<<<active_blocks, threads_per_block>>>(
+            particles,
+            event_data,
+            xs_table,
+            rng_states,
+            active_queue,
+            active_count_host,
+            escape_queue,
+            escape_count,
+            collision_queue,
+            collision_count,
+            box
+        );
 
-    const int collision_blocks = static_cast<int>(
-        (collision_count_host + threads_per_block - 1) / threads_per_block
-    );
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaDeviceSynchronize());
 
-    process_escapes_kernel<<<escape_blocks, threads_per_block>>>(
-        particles,
-        event_data,
-        escape_queue,
-        escape_count_host
-    );
+        std::uint32_t escape_count_host{};
+        std::uint32_t collision_count_host{};
 
-    process_collisions_kernel<<<collision_blocks, threads_per_block>>>(
-        particles,
-        event_data,
-        xs_table,
-        rng_states,
-        collision_queue,
-        collision_count_host,
-        next_active_queue,
-        next_active_count
-    );
+        CUDA_CHECK(cudaMemcpy(
+            &escape_count_host,
+            escape_count,
+            sizeof(std::uint32_t),
+            cudaMemcpyDeviceToHost
+        ));
 
-    CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaDeviceSynchronize());
+        CUDA_CHECK(cudaMemcpy(
+            &collision_count_host,
+            collision_count,
+            sizeof(std::uint32_t),
+            cudaMemcpyDeviceToHost
+        ));
 
-    std::cout << "escape count: " << escape_count_host << '\n';
-    std::cout << "collision count: " << collision_count_host << '\n';
-    std::cout << "classified total: " << escape_count_host + collision_count_host << '\n';
+        const int escape_blocks = static_cast<int>(
+            (escape_count_host + threads_per_block - 1) / threads_per_block
+        );
+        const int collision_blocks = static_cast<int>(
+            (collision_count_host + threads_per_block - 1) / threads_per_block
+        );
 
-    std::vector<double> x_host(10);
-    std::vector<std::uint8_t> status_host(10);
-    std::vector<std::uint32_t> collisions_host(10);
-    std::uint32_t next_active_count_host{};
-    std::vector<double> energy_host(10);
+        if (escape_count_host > 0) {
+            process_escapes_kernel<<<escape_blocks, threads_per_block>>>(
+                particles,
+                event_data,
+                escape_queue,
+                escape_count_host
+            );
+        }
 
-    CUDA_CHECK(cudaMemcpy(
-        x_host.data(),
-        particles.x,
-        x_host.size() * sizeof(double),
-        cudaMemcpyDeviceToHost
-    ));
+        if (collision_count_host > 0) {
+            process_collisions_kernel<<<collision_blocks, threads_per_block>>>(
+                particles,
+                event_data,
+                xs_table,
+                rng_states,
+                collision_queue,
+                collision_count_host,
+                next_active_queue,
+                next_active_count
+            );
+        }
 
-    CUDA_CHECK(cudaMemcpy(
-        status_host.data(),
-        particles.status,
-        status_host.size() * sizeof(std::uint8_t),
-        cudaMemcpyDeviceToHost
-    ));
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaDeviceSynchronize());
 
-    CUDA_CHECK(cudaMemcpy(
-        collisions_host.data(),
-        particles.collisions,
-        collisions_host.size() * sizeof(std::uint32_t),
-        cudaMemcpyDeviceToHost
-    ));
+        std::uint32_t next_active_count_host{};
 
-    CUDA_CHECK(cudaMemcpy(
-        &next_active_count_host,
-        next_active_count,
-        sizeof(std::uint32_t),
-        cudaMemcpyDeviceToHost
-    ));
+        CUDA_CHECK(cudaMemcpy(
+            &next_active_count_host,
+            next_active_count,
+            sizeof(std::uint32_t),
+            cudaMemcpyDeviceToHost
+        ));
 
-    CUDA_CHECK(cudaMemcpy(
-        energy_host.data(),
-        particles.energy,
-        energy_host.size() * sizeof(double),
-        cudaMemcpyDeviceToHost
-    ));
+        total_escaped += escape_count_host;
+        total_collisions += collision_count_host;
+        total_absorbed +=
+            static_cast<std::uint64_t>(collision_count_host) -
+            static_cast<std::uint64_t>(next_active_count_host);
 
-    std::cout << "first x: ";
-    for (double value : x_host) {
-        std::cout << value << ' ';
+        std::swap(active_queue, next_active_queue);
+        active_count_host = next_active_count_host;
+
+        ++iteration;
     }
-    std::cout << '\n';
 
-    std::cout << "first statuses: ";
-    for (std::uint8_t value : status_host) {
-        std::cout << static_cast<int>(value) << ' ';
-    }
-    std::cout << '\n';
-    
-    std::cout << "first collisions: ";
-    for (std::uint32_t value : collisions_host) {
-        std::cout << value << ' ';
-    }
-    std::cout << '\n';
-
-    std::cout << "next active count: " << next_active_count_host << '\n';
-
-    std::cout << "first energies: ";
-    for (double value : energy_host) {
-        std::cout << value << ' ';
-    }
-    std::cout << '\n';
+    std::cout << "iterations: " << iteration << '\n';
+    std::cout << "active left: " << active_count_host << '\n';
+    std::cout << "total escaped: " << total_escaped << '\n';
+    std::cout << "total absorbed: " << total_absorbed << '\n';
+    std::cout << "total collisions: " << total_collisions << '\n';
+    std::cout << "terminated total: "
+            << total_escaped + total_absorbed
+            << '\n';
 
     CUDA_CHECK(cudaFree(particles.x));
     CUDA_CHECK(cudaFree(particles.y));
