@@ -13,6 +13,11 @@ namespace mcm {
         double escaped_energy{};
         double absorbed_energy{};
         double recoil_energy{};
+        double track_length{};
+
+        void score_track_length(double distance) noexcept {
+            track_length += distance;
+        }
 
         [[nodiscard]] std::uint64_t total_particles() const noexcept {
             return absorbed + escaped;
@@ -32,6 +37,13 @@ namespace mcm {
 
         [[nodiscard]] double accounted_energy() const noexcept {
             return escaped_energy + absorbed_energy + recoil_energy;
+        }
+
+        [[nodiscard]] double track_length_flux(
+            std::uint64_t source_particles,
+            double volume
+        ) const noexcept {
+            return track_length / (static_cast<double>(source_particles) * volume);
         }
     };
 

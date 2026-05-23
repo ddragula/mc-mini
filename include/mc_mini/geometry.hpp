@@ -32,6 +32,10 @@ namespace mcm {
 
             return std::min({tx, ty, tz});
         }
+
+        [[nodiscard]] double volume() const noexcept {
+            return (x_max - x_min) * (y_max - y_min) * (z_max - z_min);
+        }
     };
 
 }

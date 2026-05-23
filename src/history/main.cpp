@@ -45,6 +45,7 @@ namespace mcm {
             const double boundary_distance = box.distance_to_boundary(particle);
 
             if (boundary_distance <= collision_distance) {
+                tally.score_track_length(boundary_distance);
                 move_particle(particle, boundary_distance);
 
                 particle.status = ParticleStatus::escaped;
@@ -54,6 +55,7 @@ namespace mcm {
                 return;
             }
 
+            tally.score_track_length(collision_distance);
             move_particle(particle, collision_distance);
 
             ++particle.collisions;
@@ -102,18 +104,25 @@ int main() {
     std::cout << "Escaped: " << tally.escaped << '\n';
     std::cout << "Absorption fraction: " << tally.absorption_fraction() << '\n';
     std::cout << "Escape fraction: " << tally.escape_fraction() << '\n';
-    std::cout << "Mean collisions: " << tally.mean_collisions() << std::endl << std::endl;
+    std::cout << "Mean collisions: " << tally.mean_collisions() << std::endl;
+    std::cout << std::endl;
 
     std::cout << "Source energy: " << tally.source_energy << '\n';
     std::cout << "Escaped energy: " << tally.escaped_energy << '\n';
     std::cout << "Absorbed energy: " << tally.absorbed_energy << '\n';
     std::cout << "Recoil energy: " << tally.recoil_energy << '\n';
     std::cout << "Accounted energy: " << tally.accounted_energy() << '\n';
-    std::cout << "Energy balance error: " << tally.source_energy - tally.accounted_energy() << std::endl << std::endl;
+    std::cout << "Energy balance error: " << tally.source_energy - tally.accounted_energy() << std::endl;
+    std::cout << std::endl;
 
     std::cout << "Mean energy of escaped particles: " <<
         tally.escaped_energy / static_cast<double>(tally.escaped) <<
         std::endl << std::endl;
+
+    std::cout << "Track length: " << tally.track_length << '\n';
+    std::cout << "Cell volume: " << box.volume() << '\n';
+    std::cout << "Track-length flux: " << tally.track_length_flux(particle_count, box.volume()) << std::endl;
+    std::cout << std::endl;
 
     return 0;
 }
