@@ -1,4 +1,5 @@
 #include <cuda_runtime.h>
+#include <curand_kernel.h>
 
 #include <cstdlib>
 #include <cmath>
@@ -21,6 +22,7 @@
 constexpr std::uint8_t PARTICLE_ALIVE = 0;
 constexpr std::uint8_t PARTICLE_ABSORBED = 1;
 constexpr std::uint8_t PARTICLE_ESCAPED = 2;
+constexpr double PI = 3.141592653589793238462643383279502884;
 
 struct DeviceBox {
     double x_min{};
@@ -50,6 +52,10 @@ struct DeviceParticles {
 struct DeviceEventData {
     double* collision_distance{};
     double* boundary_distance{};
+
+    double* xs_a{};
+    double* xs_s{};
+    double* xs_t{};
 };
 
 struct DeviceXsTable {
@@ -59,6 +65,7 @@ struct DeviceXsTable {
 
     std::size_t size{};
     double atom_density{};
+    double mass_number{};
 };
 
 struct DeviceCrossSections {
@@ -66,6 +73,123 @@ struct DeviceCrossSections {
     double s{};
     double t{};
 };
+
+__device__ double clamp_double(double value, double min, double max) {
+    return fmax(min, fmin(max, value));
+}
+
+__device__ double uniform01(curandState& state) {
+    double value{};
+
+    do {
+        value = curand_uniform_double(&state);
+    } while(value <= 0.0);
+
+    return value;
+}
+
+__device__ void sample_isotropic_direction(
+    curandState& state,
+    double& ux,
+    double& uy,
+    double& uz
+) {
+    const double xi1 = uniform01(state);
+    const double xi2 = uniform01(state);
+
+    const double mu = 2.0 * xi1 - 1.0;
+    const double phi = 2.0 * PI * xi2;
+
+    const double sin_theta = sqrt(fmax(0.0, 1.0 - mu * mu));
+
+    ux = sin_theta * cos(phi);
+    uy = sin_theta * sin(phi);
+    uz = mu;
+}
+
+__device__ void rotate_direction(
+    DeviceParticles particles,
+    std::uint32_t particle_index,
+    double mu_lab,
+    double phi
+) {
+    const double old_ux = particles.ux[particle_index];
+    const double old_uy = particles.uy[particle_index];
+    const double old_uz = particles.uz[particle_index];
+
+    double helper_x = 0.0;
+    double helper_y = 0.0;
+    double helper_z = 1.0;
+
+    if (fabs(old_uz) >= 0.999) {
+        helper_x = 1.0;
+        helper_z = 0.0;
+    }
+
+    double t1_x = helper_y * old_uz - helper_z * old_uy;
+    double t1_y = helper_z * old_ux - helper_x * old_uz;
+    double t1_z = helper_x * old_uy - helper_y * old_ux;
+
+    const double t1_norm = sqrt(
+        t1_x * t1_x +
+        t1_y * t1_y +
+        t1_z * t1_z
+    );
+
+    t1_x /= t1_norm;
+    t1_y /= t1_norm;
+    t1_z /= t1_norm;
+
+    const double t2_x = old_uy * t1_z - old_uz * t1_y;
+    const double t2_y = old_uz * t1_x - old_ux * t1_z;
+    const double t2_z = old_ux * t1_y - old_uy * t1_x;
+
+    mu_lab = clamp_double(mu_lab, -1.0, 1.0);
+
+    const double sin_lab = sqrt(fmax(0.0, 1.0 - mu_lab * mu_lab));
+
+    const double cos_phi = cos(phi);
+    const double sin_phi = sin(phi);
+
+    double new_ux =
+        mu_lab * old_ux +
+        sin_lab * (cos_phi * t1_x + sin_phi * t2_x);
+    double new_uy =
+        mu_lab * old_uy +
+        sin_lab * (cos_phi * t1_y + sin_phi * t2_y);
+    double new_uz =
+        mu_lab * old_uz +
+        sin_lab * (cos_phi * t1_z + sin_phi * t2_z);
+    
+    const double norm = sqrt(
+        new_ux * new_ux +
+        new_uy * new_uy +
+        new_uz * new_uz
+    );
+
+    particles.ux[particle_index] = new_ux / norm;
+    particles.uy[particle_index] = new_uy / norm;
+    particles.uz[particle_index] = new_uz / norm;
+}
+
+__device__ void scatter_elastic_isotropic_cm(
+    DeviceParticles particles,
+    std::uint32_t particle_index,
+    double mass_number,
+    curandState& rng_state
+) {
+    const double a = mass_number;
+    const double mu_cm = 2.0 * uniform01(rng_state) - 1.0;
+    const double phi = 2.0 * PI * uniform01(rng_state);
+
+    const double denominator = a * a + 2.0 * a * mu_cm + 1.0;
+    const double energy_ratio = denominator / ((a + 1.0) * (a + 1.0));
+    const double mu_lab = (1.0 + a * mu_cm) / sqrt(fmax(denominator, 1.0e-300));
+
+    particles.energy[particle_index] *= energy_ratio;
+
+    rotate_direction(particles, particle_index, mu_lab, phi);
+}
 
 __device__ double distance_to_boundary(
     DeviceParticles particles,
@@ -147,9 +271,29 @@ __device__ DeviceCrossSections lookup_cross_sections(
     return DeviceCrossSections{a, s, a + s};
 }
 
+__global__ void initialize_rng_kernel(
+    curandState* rng_states,
+    std::size_t particle_count,
+    unsigned long long seed
+) {
+    const std::size_t i = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+
+    if (i >= particle_count) {
+        return;
+    }
+
+    curand_init(
+        seed,
+        static_cast<unsigned long long>(i),
+        0,
+        &rng_states[i]
+    );
+}
+
 __global__ void initialize_particles_kernel(
     DeviceParticles particles,
     std::uint32_t* active_queue,
+    curandState* rng_states,
     std::size_t particle_count,
     double source_energy
 ) {
@@ -163,11 +307,9 @@ __global__ void initialize_particles_kernel(
     particles.y[i] = 0.0;
     particles.z[i] = 0.0;
 
-    // Deterministic direction for now.
-    // Real isotropic RNG comes later. (TODO)
-    particles.ux[i] = 1.0;
-    particles.uy[i] = 0.0;
-    particles.uz[i] = 0.0;
+    curandState local_state = rng_states[i];
+    sample_isotropic_direction(local_state, particles.ux[i], particles.uy[i], particles.uz[i]);
+    rng_states[i] = local_state;
 
     particles.energy[i] = source_energy;
     particles.collisions[i] = 0;
@@ -180,6 +322,7 @@ __global__ void classify_events_kernel(
     DeviceParticles particles,
     DeviceEventData event_data,
     DeviceXsTable xs_table,
+    curandState* rng_states,
     std::uint32_t* active_queue,
     std::size_t active_count,
     std::uint32_t* escape_queue,
@@ -198,8 +341,22 @@ __global__ void classify_events_kernel(
 
     const double boundary_distance = distance_to_boundary(particles, particle_index, box);
 
-    const DeviceCrossSections xs = lookup_cross_sections(xs_table, particles.energy[particle_index]);
-    const double collision_distance = (particle_index % 2 == 0 ? 0.5 : 2.5) / xs.t; // Placeholder for stochastic collision distance sampling.
+    const DeviceCrossSections xs = lookup_cross_sections(
+        xs_table,
+        particles.energy[particle_index]
+    );
+
+    event_data.xs_a[particle_index] = xs.a;
+    event_data.xs_s[particle_index] = xs.s;
+    event_data.xs_t[particle_index] = xs.t;
+
+    curandState local_state = rng_states[particle_index];
+    const double xi = uniform01(local_state);
+    const double optical_depth = -log(xi);
+
+    rng_states[particle_index] = local_state;
+
+    const double collision_distance = optical_depth / xs.t;
 
     event_data.boundary_distance[particle_index] = boundary_distance;
     event_data.collision_distance[particle_index] = collision_distance;
@@ -240,8 +397,12 @@ __global__ void process_escapes_kernel(
 __global__ void process_collisions_kernel(
     DeviceParticles particles,
     DeviceEventData event_data,
+    DeviceXsTable xs_table,
+    curandState* rng_states,
     std::uint32_t* collision_queue,
-    std::uint32_t collision_count
+    std::uint32_t collision_count,
+    std::uint32_t* next_active_queue,
+    std::uint32_t* next_active_count
 ) {
     const std::size_t slot = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
 
@@ -258,18 +419,45 @@ __global__ void process_collisions_kernel(
     particles.z[particle_index] += collision_distance * particles.uz[particle_index];
 
     particles.collisions[particle_index] += 1;
-    particles.status[particle_index] = PARTICLE_ABSORBED;
+    
+    curandState local_state = rng_states[particle_index];
+
+    const double xi = uniform01(local_state);
+
+    const double absorption_probability =
+        event_data.xs_a[particle_index] / event_data.xs_t[particle_index];
+
+    if (xi < absorption_probability) {
+        particles.status[particle_index] = PARTICLE_ABSORBED;
+    } else {
+        scatter_elastic_isotropic_cm(
+            particles,
+            particle_index,
+            xs_table.mass_number,
+            local_state
+        );
+
+        particles.status[particle_index] = PARTICLE_ALIVE;
+
+        const std::uint32_t position = atomicAdd(next_active_count, 1u);
+        next_active_queue[position] = particle_index;
+    }
+
+    rng_states[particle_index] = local_state;
 }
 
 int main() {
     constexpr std::size_t particle_count = 1'000'000;
     constexpr double source_energy = 2.0; // MeV
-
     const mcm::Material material = mcm::load_ace_material_from_mass_density("data/ace/C0.ACE", 2.26);
+
+    curandState* rng_states{};
+    CUDA_CHECK(cudaMalloc(&rng_states, particle_count * sizeof(curandState)));
 
     DeviceXsTable xs_table{};
     xs_table.size = material.micro_xs.energies.size();
     xs_table.atom_density = material.atom_density;
+    xs_table.mass_number = material.mass_number;
 
     CUDA_CHECK(cudaMalloc(&xs_table.energies, xs_table.size * sizeof(double)));
     CUDA_CHECK(cudaMalloc(&xs_table.absorption, xs_table.size * sizeof(double)));
@@ -311,35 +499,56 @@ int main() {
 
     CUDA_CHECK(cudaMalloc(&event_data.collision_distance, particle_count * sizeof(double)));
     CUDA_CHECK(cudaMalloc(&event_data.boundary_distance, particle_count * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&event_data.xs_a, particle_count * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&event_data.xs_s, particle_count * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&event_data.xs_t, particle_count * sizeof(double)));
 
     std::uint32_t* active_queue{};
     CUDA_CHECK(cudaMalloc(&active_queue, particle_count * sizeof(std::uint32_t)));
 
     std::uint32_t* escape_queue{};
     std::uint32_t* collision_queue{};
+    std::uint32_t* next_active_queue{};
 
     std::uint32_t* escape_count{};
     std::uint32_t* collision_count{};
+    std::uint32_t* next_active_count{};
 
     CUDA_CHECK(cudaMalloc(&escape_queue, particle_count * sizeof(std::uint32_t)));
     CUDA_CHECK(cudaMalloc(&collision_queue, particle_count * sizeof(std::uint32_t)));
+    CUDA_CHECK(cudaMalloc(&next_active_queue, particle_count * sizeof(std::uint32_t)));
     CUDA_CHECK(cudaMalloc(&escape_count, sizeof(std::uint32_t)));
     CUDA_CHECK(cudaMalloc(&collision_count, sizeof(std::uint32_t)));
+    CUDA_CHECK(cudaMalloc(&next_active_count, sizeof(std::uint32_t)));
 
     CUDA_CHECK(cudaMemset(escape_count, 0, sizeof(std::uint32_t)));
     CUDA_CHECK(cudaMemset(collision_count, 0, sizeof(std::uint32_t)));
+    CUDA_CHECK(cudaMemset(next_active_count, 0, sizeof(std::uint32_t)));
 
     constexpr int threads_per_block = 256;
     const int blocks = static_cast<int>(
         (particle_count + threads_per_block - 1) / threads_per_block
     );
 
+    initialize_rng_kernel<<<blocks, threads_per_block>>>(
+        rng_states,
+        particle_count,
+        12345ULL
+    );
+
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
+
     initialize_particles_kernel<<<blocks, threads_per_block>>>(
         particles,
         active_queue,
+        rng_states,
         particle_count,
         source_energy
     );
+
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
 
     const DeviceBox box{
         .x_min = -5.0,
@@ -354,6 +563,7 @@ int main() {
         particles,
         event_data,
         xs_table,
+        rng_states,
         active_queue,
         particle_count,
         escape_queue,
@@ -401,8 +611,12 @@ int main() {
     process_collisions_kernel<<<collision_blocks, threads_per_block>>>(
         particles,
         event_data,
+        xs_table,
+        rng_states,
         collision_queue,
-        collision_count_host
+        collision_count_host,
+        next_active_queue,
+        next_active_count
     );
 
     CUDA_CHECK(cudaGetLastError());
@@ -415,6 +629,8 @@ int main() {
     std::vector<double> x_host(10);
     std::vector<std::uint8_t> status_host(10);
     std::vector<std::uint32_t> collisions_host(10);
+    std::uint32_t next_active_count_host{};
+    std::vector<double> energy_host(10);
 
     CUDA_CHECK(cudaMemcpy(
         x_host.data(),
@@ -437,6 +653,20 @@ int main() {
         cudaMemcpyDeviceToHost
     ));
 
+    CUDA_CHECK(cudaMemcpy(
+        &next_active_count_host,
+        next_active_count,
+        sizeof(std::uint32_t),
+        cudaMemcpyDeviceToHost
+    ));
+
+    CUDA_CHECK(cudaMemcpy(
+        energy_host.data(),
+        particles.energy,
+        energy_host.size() * sizeof(double),
+        cudaMemcpyDeviceToHost
+    ));
+
     std::cout << "first x: ";
     for (double value : x_host) {
         std::cout << value << ' ';
@@ -455,6 +685,14 @@ int main() {
     }
     std::cout << '\n';
 
+    std::cout << "next active count: " << next_active_count_host << '\n';
+
+    std::cout << "first energies: ";
+    for (double value : energy_host) {
+        std::cout << value << ' ';
+    }
+    std::cout << '\n';
+
     CUDA_CHECK(cudaFree(particles.x));
     CUDA_CHECK(cudaFree(particles.y));
     CUDA_CHECK(cudaFree(particles.z));
@@ -467,13 +705,19 @@ int main() {
     CUDA_CHECK(cudaFree(active_queue));
     CUDA_CHECK(cudaFree(escape_queue));
     CUDA_CHECK(cudaFree(collision_queue));
+    CUDA_CHECK(cudaFree(next_active_queue));
     CUDA_CHECK(cudaFree(escape_count));
     CUDA_CHECK(cudaFree(collision_count));
+    CUDA_CHECK(cudaFree(next_active_count));
     CUDA_CHECK(cudaFree(event_data.collision_distance));
     CUDA_CHECK(cudaFree(event_data.boundary_distance));
+    CUDA_CHECK(cudaFree(event_data.xs_a));
+    CUDA_CHECK(cudaFree(event_data.xs_s));
+    CUDA_CHECK(cudaFree(event_data.xs_t));
     CUDA_CHECK(cudaFree(xs_table.energies));
     CUDA_CHECK(cudaFree(xs_table.absorption));
     CUDA_CHECK(cudaFree(xs_table.elastic));
+    CUDA_CHECK(cudaFree(rng_states));
 
     return 0;
 }
