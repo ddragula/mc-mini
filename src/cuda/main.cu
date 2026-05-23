@@ -45,6 +45,11 @@ struct DeviceParticles {
     std::uint8_t* status{};
 };
 
+struct DeviceEventData {
+    double* collision_distance{};
+    double* boundary_distance{};
+};
+
 __device__ double distance_to_boundary(
     DeviceParticles particles,
     std::uint32_t index,
@@ -104,6 +109,7 @@ __global__ void initialize_particles_kernel(
 
 __global__ void classify_events_kernel(
     DeviceParticles particles,
+    DeviceEventData event_data,
     std::uint32_t* active_queue,
     std::size_t active_count,
     std::uint32_t* escape_queue,
@@ -123,6 +129,9 @@ __global__ void classify_events_kernel(
     const double boundary_distance = distance_to_boundary(particles, particle_index, box);
     const double collision_distance = particle_index % 2 == 0 ? 3.0 : 7.0; // Placeholder for now. (TODO)
 
+    event_data.boundary_distance[particle_index] = boundary_distance;
+    event_data.collision_distance[particle_index] = collision_distance;
+
     if (boundary_distance <= collision_distance) {
         const std::uint32_t position = atomicAdd(escape_count, 1u);
         escape_queue[position] = particle_index;
@@ -135,9 +144,9 @@ __global__ void classify_events_kernel(
 
 __global__ void process_escapes_kernel(
     DeviceParticles particles,
+    DeviceEventData event_data,
     std::uint32_t* escape_queue,
-    std::uint32_t escape_count,
-    DeviceBox box
+    std::uint32_t escape_count
 ) {
     const std::size_t slot = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
 
@@ -147,7 +156,7 @@ __global__ void process_escapes_kernel(
 
     const std::uint32_t particle_index = escape_queue[slot];
 
-    const double distance = distance_to_boundary(particles, particle_index, box);
+    const double distance = event_data.boundary_distance[particle_index];
 
     particles.x[particle_index] += distance * particles.ux[particle_index];
     particles.y[particle_index] += distance * particles.uy[particle_index];
@@ -158,6 +167,7 @@ __global__ void process_escapes_kernel(
 
 __global__ void process_collisions_kernel(
     DeviceParticles particles,
+    DeviceEventData event_data,
     std::uint32_t* collision_queue,
     std::uint32_t collision_count
 ) {
@@ -169,7 +179,7 @@ __global__ void process_collisions_kernel(
 
     const std::uint32_t particle_index = collision_queue[slot];
 
-    constexpr double collision_distance = 3.0; // Placeholder for now. (TODO)
+    const double collision_distance = event_data.collision_distance[particle_index];
 
     particles.x[particle_index] += collision_distance * particles.ux[particle_index];
     particles.y[particle_index] += collision_distance * particles.uy[particle_index];
@@ -184,6 +194,7 @@ int main() {
     constexpr double source_energy = 2.0; // MeV
 
     DeviceParticles particles{};
+    DeviceEventData event_data{};
 
     CUDA_CHECK(cudaMalloc(&particles.x, particle_count * sizeof(double)));
     CUDA_CHECK(cudaMalloc(&particles.y, particle_count * sizeof(double)));
@@ -194,6 +205,9 @@ int main() {
     CUDA_CHECK(cudaMalloc(&particles.collisions, particle_count * sizeof(std::uint32_t)));
     CUDA_CHECK(cudaMalloc(&particles.energy, particle_count * sizeof(double)));
     CUDA_CHECK(cudaMalloc(&particles.status, particle_count * sizeof(std::uint8_t)));
+
+    CUDA_CHECK(cudaMalloc(&event_data.collision_distance, particle_count * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&event_data.boundary_distance, particle_count * sizeof(double)));
 
     std::uint32_t* active_queue{};
     CUDA_CHECK(cudaMalloc(&active_queue, particle_count * sizeof(std::uint32_t)));
@@ -235,6 +249,7 @@ int main() {
 
     classify_events_kernel<<<blocks, threads_per_block>>>(
         particles,
+        event_data,
         active_queue,
         particle_count,
         escape_queue,
@@ -274,13 +289,14 @@ int main() {
 
     process_escapes_kernel<<<escape_blocks, threads_per_block>>>(
         particles,
+        event_data,
         escape_queue,
-        escape_count_host,
-        box
+        escape_count_host
     );
 
     process_collisions_kernel<<<collision_blocks, threads_per_block>>>(
         particles,
+        event_data,
         collision_queue,
         collision_count_host
     );
@@ -349,6 +365,8 @@ int main() {
     CUDA_CHECK(cudaFree(collision_queue));
     CUDA_CHECK(cudaFree(escape_count));
     CUDA_CHECK(cudaFree(collision_count));
+    CUDA_CHECK(cudaFree(event_data.collision_distance));
+    CUDA_CHECK(cudaFree(event_data.boundary_distance));
 
     return 0;
 }
