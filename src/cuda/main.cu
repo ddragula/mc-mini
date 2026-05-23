@@ -75,6 +75,13 @@ struct DeviceCrossSections {
     double t{};
 };
 
+struct DeviceTally {
+    double* escaped_energy{};
+    double* absorbed_energy{};
+    double* recoil_energy{};
+    double* track_length{};
+};
+
 __device__ double clamp_double(double value, double min, double max) {
     return fmax(min, fmin(max, value));
 }
@@ -375,6 +382,7 @@ __global__ void classify_events_kernel(
 __global__ void process_escapes_kernel(
     DeviceParticles particles,
     DeviceEventData event_data,
+    DeviceTally tally,
     std::uint32_t* escape_queue,
     std::uint32_t escape_count
 ) {
@@ -387,6 +395,8 @@ __global__ void process_escapes_kernel(
     const std::uint32_t particle_index = escape_queue[slot];
 
     const double distance = event_data.boundary_distance[particle_index];
+    atomicAdd(tally.track_length, distance);
+    atomicAdd(tally.escaped_energy, particles.energy[particle_index]);
 
     particles.x[particle_index] += distance * particles.ux[particle_index];
     particles.y[particle_index] += distance * particles.uy[particle_index];
@@ -399,6 +409,7 @@ __global__ void process_collisions_kernel(
     DeviceParticles particles,
     DeviceEventData event_data,
     DeviceXsTable xs_table,
+    DeviceTally tally,
     curandState* rng_states,
     std::uint32_t* collision_queue,
     std::uint32_t collision_count,
@@ -414,12 +425,15 @@ __global__ void process_collisions_kernel(
     const std::uint32_t particle_index = collision_queue[slot];
 
     const double collision_distance = event_data.collision_distance[particle_index];
+    atomicAdd(tally.track_length, collision_distance);
 
     particles.x[particle_index] += collision_distance * particles.ux[particle_index];
     particles.y[particle_index] += collision_distance * particles.uy[particle_index];
     particles.z[particle_index] += collision_distance * particles.uz[particle_index];
 
     particles.collisions[particle_index] += 1;
+
+    const double energy_before_collision = particles.energy[particle_index];
     
     curandState local_state = rng_states[particle_index];
 
@@ -430,6 +444,7 @@ __global__ void process_collisions_kernel(
 
     if (xi < absorption_probability) {
         particles.status[particle_index] = PARTICLE_ABSORBED;
+        atomicAdd(tally.absorbed_energy, energy_before_collision);
     } else {
         scatter_elastic_isotropic_cm(
             particles,
@@ -437,6 +452,9 @@ __global__ void process_collisions_kernel(
             xs_table.mass_number,
             local_state
         );
+
+        const double energy_after_collision = particles.energy[particle_index];
+        atomicAdd(tally.recoil_energy, energy_before_collision - energy_after_collision);
 
         particles.status[particle_index] = PARTICLE_ALIVE;
 
@@ -448,7 +466,7 @@ __global__ void process_collisions_kernel(
 }
 
 int main() {
-    constexpr std::size_t particle_count = 1'000'000;
+    constexpr std::size_t particle_count = 100'000'000;
     constexpr double source_energy = 2.0; // MeV
     const mcm::Material material = mcm::load_ace_material_from_mass_density("data/ace/C0.ACE", 2.26);
 
@@ -487,6 +505,7 @@ int main() {
 
     DeviceParticles particles{};
     DeviceEventData event_data{};
+    DeviceTally tally{};
 
     CUDA_CHECK(cudaMalloc(&particles.x, particle_count * sizeof(double)));
     CUDA_CHECK(cudaMalloc(&particles.y, particle_count * sizeof(double)));
@@ -503,6 +522,16 @@ int main() {
     CUDA_CHECK(cudaMalloc(&event_data.xs_a, particle_count * sizeof(double)));
     CUDA_CHECK(cudaMalloc(&event_data.xs_s, particle_count * sizeof(double)));
     CUDA_CHECK(cudaMalloc(&event_data.xs_t, particle_count * sizeof(double)));
+
+    CUDA_CHECK(cudaMalloc(&tally.escaped_energy, sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&tally.absorbed_energy, sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&tally.recoil_energy, sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&tally.track_length, sizeof(double)));
+
+    CUDA_CHECK(cudaMemset(tally.escaped_energy, 0, sizeof(double)));
+    CUDA_CHECK(cudaMemset(tally.absorbed_energy, 0, sizeof(double)));
+    CUDA_CHECK(cudaMemset(tally.recoil_energy, 0, sizeof(double)));
+    CUDA_CHECK(cudaMemset(tally.track_length, 0, sizeof(double)));
 
     std::uint32_t* active_queue{};
     CUDA_CHECK(cudaMalloc(&active_queue, particle_count * sizeof(std::uint32_t)));
@@ -624,6 +653,7 @@ int main() {
             process_escapes_kernel<<<escape_blocks, threads_per_block>>>(
                 particles,
                 event_data,
+                tally,
                 escape_queue,
                 escape_count_host
             );
@@ -634,6 +664,7 @@ int main() {
                 particles,
                 event_data,
                 xs_table,
+                tally,
                 rng_states,
                 collision_queue,
                 collision_count_host,
@@ -674,6 +705,70 @@ int main() {
     std::cout << "terminated total: "
             << total_escaped + total_absorbed
             << '\n';
+    
+    // === TALLY RESULTS ===
+
+    double escaped_energy_host{};
+    double absorbed_energy_host{};
+    double recoil_energy_host{};
+    double track_length_host{};
+
+    CUDA_CHECK(cudaMemcpy(
+        &escaped_energy_host,
+        tally.escaped_energy,
+        sizeof(double),
+        cudaMemcpyDeviceToHost
+    ));
+
+    CUDA_CHECK(cudaMemcpy(
+        &absorbed_energy_host,
+        tally.absorbed_energy,
+        sizeof(double),
+        cudaMemcpyDeviceToHost
+    ));
+
+    CUDA_CHECK(cudaMemcpy(
+        &recoil_energy_host,
+        tally.recoil_energy,
+        sizeof(double),
+        cudaMemcpyDeviceToHost
+    ));
+
+    CUDA_CHECK(cudaMemcpy(
+        &track_length_host,
+        tally.track_length,
+        sizeof(double),
+        cudaMemcpyDeviceToHost
+    ));
+
+    const double source_energy_total = static_cast<double>(particle_count) * source_energy;
+    const double accounted_energy = escaped_energy_host + absorbed_energy_host + recoil_energy_host;
+    const double volume = (box.x_max - box.x_min) * (box.y_max - box.y_min) * (box.z_max - box.z_min);
+
+    std::cout << '\n';
+
+    std::cout << "Source energy: " << source_energy_total << '\n';
+    std::cout << "Escaped energy: " << escaped_energy_host << '\n';
+    std::cout << "Absorbed energy: " << absorbed_energy_host << '\n';
+    std::cout << "Recoil energy: " << recoil_energy_host << '\n';
+    std::cout << "Accounted energy: " << accounted_energy << '\n';
+    std::cout << "Energy balance error: "
+        << source_energy_total - accounted_energy
+        << '\n';
+
+    std::cout << '\n';
+
+    std::cout << "Mean energy of escaped particles: "
+        << escaped_energy_host / static_cast<double>(total_escaped)
+        << '\n';
+
+    std::cout << "Track length: " << track_length_host << '\n';
+    std::cout << "Cell volume: " << volume << '\n';
+    std::cout << "Track-length flux: "
+        << track_length_host / (static_cast<double>(particle_count) * volume)
+        << '\n';
+
+    // === MEMORY CLEANUP ===
 
     CUDA_CHECK(cudaFree(particles.x));
     CUDA_CHECK(cudaFree(particles.y));
@@ -700,6 +795,10 @@ int main() {
     CUDA_CHECK(cudaFree(xs_table.absorption));
     CUDA_CHECK(cudaFree(xs_table.elastic));
     CUDA_CHECK(cudaFree(rng_states));
+    CUDA_CHECK(cudaFree(tally.escaped_energy));
+    CUDA_CHECK(cudaFree(tally.absorbed_energy));
+    CUDA_CHECK(cudaFree(tally.recoil_energy));
+    CUDA_CHECK(cudaFree(tally.track_length));
 
     return 0;
 }
