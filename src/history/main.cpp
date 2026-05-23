@@ -5,20 +5,19 @@
 #include "mc_mini/rng.hpp"
 #include "mc_mini/tally.hpp"
 #include "mc_mini/scattering.hpp"
+#include "mc_mini/ace_loader.hpp"
 
 namespace mcm {
     Particle sample_source_particle(Rng& rng) {
-        Particle particle{};
+        Particle particle;
 
-        particle.x = 0.0;
-        particle.y = 0.0;
-        particle.z = 0.0;
+        particle.energy = 2.0; // MeV
 
-        particle.energy = 1.0;
-        particle.collisions = 0;
-        particle.status = ParticleStatus::alive;
-
-        rng.sample_isotropic_direction(particle.ux, particle.uy, particle.uz);
+        rng.sample_isotropic_direction(
+            particle.ux,
+            particle.uy,
+            particle.uz
+        );
 
         return particle;
     }
@@ -39,8 +38,10 @@ namespace mcm {
         tally.source_energy += particle.energy;
 
         while (particle.is_alive()) {
+            const CrossSections xs = material.cross_sections(particle.energy);
+
             const double optical_depth = rng.sample_optical_depth();
-            const double collision_distance = optical_depth / material.xs_t();
+            const double collision_distance = optical_depth / xs.t;
             const double boundary_distance = box.distance_to_boundary(particle);
 
             if (boundary_distance <= collision_distance) {
@@ -58,7 +59,7 @@ namespace mcm {
             ++particle.collisions;
             ++tally.collisions;
 
-            if (rng.uniform01() < material.absorption_probability()) {
+            if (rng.uniform01() < xs.a / xs.t) {
                 particle.status = ParticleStatus::absorbed;
                 tally.absorbed += 1;
                 tally.absorbed_energy += particle.energy;
@@ -76,20 +77,16 @@ namespace mcm {
 }
 
 int main() {
-    constexpr std::uint64_t particle_count = 10'000'000;
+    constexpr std::uint64_t particle_count = 1'000'000;
 
-    mcm::Rng rng(12345);
+    mcm::Rng rng(123);
 
     const mcm::Box box{
-        .x_min = -1.0, .y_min = -1.0, .z_min = -1.0,
-        .x_max = 1.0, .y_max = 1.0, .z_max = 1.0
+        .x_min = -5.0, .y_min = -5.0, .z_min = -5.0,
+        .x_max = 5.0, .y_max = 5.0, .z_max = 5.0
     };
 
-    const mcm::Material material{
-        .xs_a = 0.2,
-        .xs_s = 0.8,
-        .mass_number = 12.0
-    };
+    const mcm::Material material = mcm::load_ace_material_from_mass_density("data/ace/C0.ACE", 2.26);
 
     mcm::Tally tally{};
 
@@ -99,6 +96,7 @@ int main() {
     }
 
     std::cout << "==== SIMULATION RESULTS =====" << std::endl << std::endl;
+
     std::cout << "Total: " << tally.total_particles() << '\n';
     std::cout << "Absorbed: " << tally.absorbed << '\n';
     std::cout << "Escaped: " << tally.escaped << '\n';
@@ -112,6 +110,10 @@ int main() {
     std::cout << "Recoil energy: " << tally.recoil_energy << '\n';
     std::cout << "Accounted energy: " << tally.accounted_energy() << '\n';
     std::cout << "Energy balance error: " << tally.source_energy - tally.accounted_energy() << std::endl << std::endl;
+
+    std::cout << "Mean energy of escaped particles: " <<
+        tally.escaped_energy / static_cast<double>(tally.escaped) <<
+        std::endl << std::endl;
 
     return 0;
 }
