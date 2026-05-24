@@ -1,6 +1,6 @@
 {
-  "particle_count": 1e6,
-  "box_side_length": 10,
+  "particle_count": 10e6,
+  "box_side_length": 20,
   "material_file": "data/ace/C0.ACE",
   "mass_density": 2.26
 }
