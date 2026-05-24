@@ -576,17 +576,6 @@ int main() {
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
 
-    initialize_particles_kernel<<<blocks, threads_per_block>>>(
-        particles,
-        active_queue,
-        rng_states,
-        particle_count,
-        source_energy
-    );
-
-    CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaDeviceSynchronize());
-
     const DeviceBox box{
         .x_min = -5.0,
         .y_min = -5.0,
@@ -606,6 +595,17 @@ int main() {
     constexpr std::uint32_t max_iterations = 10000;
 
     mcm::timer::record_initialization_end();
+
+    initialize_particles_kernel<<<blocks, threads_per_block>>>(
+        particles,
+        active_queue,
+        rng_states,
+        particle_count,
+        source_energy
+    );
+
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
 
     while (active_count_host > 0 && iteration < max_iterations) {
         CUDA_CHECK(cudaMemset(escape_count, 0, sizeof(std::uint32_t)));
