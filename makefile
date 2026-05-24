@@ -1,4 +1,4 @@
-.PHONY: debug release runh runc run-debug-history run-release-history run-debug-cuda run-release-cuda clean
+.PHONY: debug release runh runc run-debug-history run-release-history run-debug-cuda run-release-cuda h c clean
 
 debug:
 	cmake --preset debug
@@ -23,6 +23,12 @@ run-release-cuda: release
 runh: run-release-history
 
 runc: run-release-cuda
+
+h:
+	./build/release/mc_history
+
+c:
+	./build/release/mc_cuda
 
 clean:
 	rm -rf build

@@ -86,7 +86,7 @@ namespace mcm {
 int main() {
     mcm::timer::record_start();
 
-    constexpr std::uint64_t particle_count = 200'000'000;
+    constexpr std::uint64_t particle_count = 10'000'000;
 
     mcm::Rng rng(12345);
 
