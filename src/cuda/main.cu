@@ -25,9 +25,8 @@
         }                                                                               \
     } while (0)
 
-constexpr std::uint8_t PARTICLE_ALIVE = 0;
-constexpr std::uint8_t PARTICLE_ABSORBED = 1;
-constexpr std::uint8_t PARTICLE_ESCAPED = 2;
+constexpr int THREADS_PER_BLOCK = 256;
+constexpr std::uint32_t INVALID_XS_INDEX = 0xffffffffu;
 constexpr double PI = 3.141592653589793238462643383279502884;
 
 struct DeviceBox {
@@ -50,9 +49,7 @@ struct DeviceParticles {
     double* uz{};
 
     double* energy{};
-
-    std::uint32_t* collisions{};
-    std::uint8_t* status{};
+    std::uint32_t* xs_index{};
 };
 
 struct DeviceEventData {
@@ -60,7 +57,6 @@ struct DeviceEventData {
     double* boundary_distance{};
 
     double* xs_a{};
-    double* xs_s{};
     double* xs_t{};
 };
 
@@ -76,7 +72,6 @@ struct DeviceXsTable {
 
 struct DeviceCrossSections {
     double a{};
-    double s{};
     double t{};
 };
 
@@ -86,6 +81,39 @@ struct DeviceTally {
     double* recoil_energy{};
     double* track_length{};
 };
+
+__device__ void append_queue_warp_aggregated(
+    bool predicate,
+    std::uint32_t value,
+    std::uint32_t* queue,
+    std::uint32_t* count
+) {
+    const unsigned int active_mask = __activemask();
+    const unsigned int selected_mask = __ballot_sync(active_mask, predicate);
+
+    if (selected_mask == 0u) {
+        return;
+    }
+
+    const int lane = static_cast<int>(threadIdx.x) & 31;
+    const int leader = __ffs(selected_mask) - 1;
+    const std::uint32_t selected_count = static_cast<std::uint32_t>(__popc(selected_mask));
+
+    std::uint32_t base = 0;
+
+    if (lane == leader) {
+        base = atomicAdd(count, selected_count);
+    }
+
+    base = __shfl_sync(active_mask, base, leader);
+
+    if (predicate) {
+        const unsigned int preceding_lanes = selected_mask & ((1u << lane) - 1u);
+        const std::uint32_t offset = static_cast<std::uint32_t>(__popc(preceding_lanes));
+
+        queue[base + offset] = value;
+    }
+}
 
 __device__ double clamp_double(double value, double min, double max) {
     return fmax(min, fmin(max, value));
@@ -234,13 +262,15 @@ __device__ double distance_to_boundary(
 
 __device__ DeviceCrossSections lookup_cross_sections(
     DeviceXsTable table,
-    double energy
+    double energy,
+    std::uint32_t& grid_index
 ) {
     if (energy <= table.energies[0]) {
         const double a = table.absorption[0] * table.atom_density;
         const double s = table.elastic[0] * table.atom_density;
-        
-        return DeviceCrossSections{a, s, a + s};
+
+        grid_index = 0;
+        return DeviceCrossSections{a, a + s};
     }
 
     const std::size_t last = table.size - 1;
@@ -249,22 +279,38 @@ __device__ DeviceCrossSections lookup_cross_sections(
         const double a = table.absorption[last] * table.atom_density;
         const double s = table.elastic[last] * table.atom_density;
 
-        return DeviceCrossSections{a, s, a + s};
+        grid_index = static_cast<std::uint32_t>(last > 0 ? last - 1 : 0);
+        return DeviceCrossSections{a, a + s};
     }
 
-    std::size_t left = 0;
-    std::size_t right = last;
+    std::size_t left = grid_index;
 
-    while (right - left > 1) {
-        const std::size_t mid = left + (right - left) / 2;
+    if (grid_index == INVALID_XS_INDEX || left >= last) {
+        left = 0;
+        std::size_t right = last;
 
-        if (table.energies[mid] > energy) {
-            right = mid;
-        } else {
-            left = mid;
+        while (right - left > 1) {
+            const std::size_t mid = left + (right - left) / 2;
+
+            if (table.energies[mid] > energy) {
+                right = mid;
+            } else {
+                left = mid;
+            }
+        }
+    } else {
+        while (left + 1 < table.size && table.energies[left + 1] <= energy) {
+            ++left;
+        }
+
+        while (left > 0 && table.energies[left] > energy) {
+            --left;
         }
     }
 
+    grid_index = static_cast<std::uint32_t>(left);
+
+    const std::size_t right = left + 1;
     const double e0 = table.energies[left];
     const double e1 = table.energies[right];
 
@@ -281,7 +327,7 @@ __device__ DeviceCrossSections lookup_cross_sections(
     const double a = micro_a * table.atom_density;
     const double s = micro_s * table.atom_density;
 
-    return DeviceCrossSections{a, s, a + s};
+    return DeviceCrossSections{a, a + s};
 }
 
 __global__ void initialize_rng_kernel(
@@ -325,8 +371,7 @@ __global__ void initialize_particles_kernel(
     rng_states[i] = local_state;
 
     particles.energy[i] = source_energy;
-    particles.collisions[i] = 0;
-    particles.status[i] = PARTICLE_ALIVE;
+    particles.xs_index[i] = INVALID_XS_INDEX;
 
     active_queue[i] = static_cast<std::uint32_t>(i);
 }
@@ -353,14 +398,16 @@ __global__ void classify_events_kernel(
     const std::uint32_t particle_index = active_queue[slot];
 
     const double boundary_distance = distance_to_boundary(particles, particle_index, box);
+    std::uint32_t grid_index = particles.xs_index[particle_index];
 
     const DeviceCrossSections xs = lookup_cross_sections(
         xs_table,
-        particles.energy[particle_index]
+        particles.energy[particle_index],
+        grid_index
     );
 
+    particles.xs_index[particle_index] = grid_index;
     event_data.xs_a[particle_index] = xs.a;
-    event_data.xs_s[particle_index] = xs.s;
     event_data.xs_t[particle_index] = xs.t;
 
     curandState local_state = rng_states[particle_index];
@@ -374,14 +421,21 @@ __global__ void classify_events_kernel(
     event_data.boundary_distance[particle_index] = boundary_distance;
     event_data.collision_distance[particle_index] = collision_distance;
 
-    if (boundary_distance <= collision_distance) {
-        const std::uint32_t position = atomicAdd(escape_count, 1u);
-        escape_queue[position] = particle_index;
-        return;
-    }
+    const bool escapes = boundary_distance <= collision_distance;
 
-    const std::uint32_t position = atomicAdd(collision_count, 1u);
-    collision_queue[position] = particle_index;
+    append_queue_warp_aggregated(
+        escapes,
+        particle_index,
+        escape_queue,
+        escape_count
+    );
+
+    append_queue_warp_aggregated(
+        !escapes,
+        particle_index,
+        collision_queue,
+        collision_count
+    );
 }
 
 __global__ void process_escapes_kernel(
@@ -392,22 +446,45 @@ __global__ void process_escapes_kernel(
     std::uint32_t escape_count
 ) {
     const std::size_t slot = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const bool active = slot < escape_count;
+    const int local_index = static_cast<int>(threadIdx.x);
 
-    if (slot >= escape_count) {
-        return;
+    double track_length = 0.0;
+    double escaped_energy = 0.0;
+
+    if (active) {
+        const std::uint32_t particle_index = escape_queue[slot];
+
+        const double distance = event_data.boundary_distance[particle_index];
+        track_length = distance;
+        escaped_energy = particles.energy[particle_index];
+
+        particles.x[particle_index] += distance * particles.ux[particle_index];
+        particles.y[particle_index] += distance * particles.uy[particle_index];
+        particles.z[particle_index] += distance * particles.uz[particle_index];
     }
 
-    const std::uint32_t particle_index = escape_queue[slot];
+    __shared__ double track_length_sums[THREADS_PER_BLOCK];
+    __shared__ double escaped_energy_sums[THREADS_PER_BLOCK];
 
-    const double distance = event_data.boundary_distance[particle_index];
-    atomicAdd(tally.track_length, distance);
-    atomicAdd(tally.escaped_energy, particles.energy[particle_index]);
+    track_length_sums[local_index] = track_length;
+    escaped_energy_sums[local_index] = escaped_energy;
 
-    particles.x[particle_index] += distance * particles.ux[particle_index];
-    particles.y[particle_index] += distance * particles.uy[particle_index];
-    particles.z[particle_index] += distance * particles.uz[particle_index];
+    for (int stride = blockDim.x / 2; stride > 0; stride /= 2) {
+        __syncthreads();
 
-    particles.status[particle_index] = PARTICLE_ESCAPED;
+        if (local_index < stride) {
+            track_length_sums[local_index] += track_length_sums[local_index + stride];
+            escaped_energy_sums[local_index] += escaped_energy_sums[local_index + stride];
+        }
+    }
+
+    __syncthreads();
+
+    if (local_index == 0) {
+        atomicAdd(tally.track_length, track_length_sums[0]);
+        atomicAdd(tally.escaped_energy, escaped_energy_sums[0]);
+    }
 }
 
 __global__ void process_collisions_kernel(
@@ -422,52 +499,86 @@ __global__ void process_collisions_kernel(
     std::uint32_t* next_active_count
 ) {
     const std::size_t slot = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const bool active = slot < collision_count;
+    const int local_index = static_cast<int>(threadIdx.x);
 
-    if (slot >= collision_count) {
-        return;
+    std::uint32_t particle_index = 0;
+    bool remains_active = false;
+
+    double track_length = 0.0;
+    double absorbed_energy = 0.0;
+    double recoil_energy = 0.0;
+
+    if (active) {
+        particle_index = collision_queue[slot];
+
+        const double collision_distance = event_data.collision_distance[particle_index];
+        track_length = collision_distance;
+
+        particles.x[particle_index] += collision_distance * particles.ux[particle_index];
+        particles.y[particle_index] += collision_distance * particles.uy[particle_index];
+        particles.z[particle_index] += collision_distance * particles.uz[particle_index];
+
+        const double energy_before_collision = particles.energy[particle_index];
+        
+        curandState local_state = rng_states[particle_index];
+
+        const double xi = uniform01(local_state);
+
+        const double absorption_probability =
+            event_data.xs_a[particle_index] / event_data.xs_t[particle_index];
+
+        if (xi < absorption_probability) {
+            absorbed_energy = energy_before_collision;
+        } else {
+            scatter_elastic_isotropic_cm(
+                particles,
+                particle_index,
+                xs_table.mass_number,
+                local_state
+            );
+
+            const double energy_after_collision = particles.energy[particle_index];
+            recoil_energy = energy_before_collision - energy_after_collision;
+
+            remains_active = true;
+        }
+
+        rng_states[particle_index] = local_state;
     }
 
-    const std::uint32_t particle_index = collision_queue[slot];
+    append_queue_warp_aggregated(
+        remains_active,
+        particle_index,
+        next_active_queue,
+        next_active_count
+    );
 
-    const double collision_distance = event_data.collision_distance[particle_index];
-    atomicAdd(tally.track_length, collision_distance);
+    __shared__ double track_length_sums[THREADS_PER_BLOCK];
+    __shared__ double absorbed_energy_sums[THREADS_PER_BLOCK];
+    __shared__ double recoil_energy_sums[THREADS_PER_BLOCK];
 
-    particles.x[particle_index] += collision_distance * particles.ux[particle_index];
-    particles.y[particle_index] += collision_distance * particles.uy[particle_index];
-    particles.z[particle_index] += collision_distance * particles.uz[particle_index];
+    track_length_sums[local_index] = track_length;
+    absorbed_energy_sums[local_index] = absorbed_energy;
+    recoil_energy_sums[local_index] = recoil_energy;
 
-    particles.collisions[particle_index] += 1;
+    for (int stride = blockDim.x / 2; stride > 0; stride /= 2) {
+        __syncthreads();
 
-    const double energy_before_collision = particles.energy[particle_index];
-    
-    curandState local_state = rng_states[particle_index];
-
-    const double xi = uniform01(local_state);
-
-    const double absorption_probability =
-        event_data.xs_a[particle_index] / event_data.xs_t[particle_index];
-
-    if (xi < absorption_probability) {
-        particles.status[particle_index] = PARTICLE_ABSORBED;
-        atomicAdd(tally.absorbed_energy, energy_before_collision);
-    } else {
-        scatter_elastic_isotropic_cm(
-            particles,
-            particle_index,
-            xs_table.mass_number,
-            local_state
-        );
-
-        const double energy_after_collision = particles.energy[particle_index];
-        atomicAdd(tally.recoil_energy, energy_before_collision - energy_after_collision);
-
-        particles.status[particle_index] = PARTICLE_ALIVE;
-
-        const std::uint32_t position = atomicAdd(next_active_count, 1u);
-        next_active_queue[position] = particle_index;
+        if (local_index < stride) {
+            track_length_sums[local_index] += track_length_sums[local_index + stride];
+            absorbed_energy_sums[local_index] += absorbed_energy_sums[local_index + stride];
+            recoil_energy_sums[local_index] += recoil_energy_sums[local_index + stride];
+        }
     }
 
-    rng_states[particle_index] = local_state;
+    __syncthreads();
+
+    if (local_index == 0) {
+        atomicAdd(tally.track_length, track_length_sums[0]);
+        atomicAdd(tally.absorbed_energy, absorbed_energy_sums[0]);
+        atomicAdd(tally.recoil_energy, recoil_energy_sums[0]);
+    }
 }
 
 int main(int argc, char* argv[]) {
@@ -524,14 +635,12 @@ int main(int argc, char* argv[]) {
     CUDA_CHECK(cudaMalloc(&particles.ux, particle_count * sizeof(double)));
     CUDA_CHECK(cudaMalloc(&particles.uy, particle_count * sizeof(double)));
     CUDA_CHECK(cudaMalloc(&particles.uz, particle_count * sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&particles.collisions, particle_count * sizeof(std::uint32_t)));
     CUDA_CHECK(cudaMalloc(&particles.energy, particle_count * sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&particles.status, particle_count * sizeof(std::uint8_t)));
+    CUDA_CHECK(cudaMalloc(&particles.xs_index, particle_count * sizeof(std::uint32_t)));
 
     CUDA_CHECK(cudaMalloc(&event_data.collision_distance, particle_count * sizeof(double)));
     CUDA_CHECK(cudaMalloc(&event_data.boundary_distance, particle_count * sizeof(double)));
     CUDA_CHECK(cudaMalloc(&event_data.xs_a, particle_count * sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&event_data.xs_s, particle_count * sizeof(double)));
     CUDA_CHECK(cudaMalloc(&event_data.xs_t, particle_count * sizeof(double)));
 
     CUDA_CHECK(cudaMalloc(&tally.escaped_energy, sizeof(double)));
@@ -567,12 +676,11 @@ int main(int argc, char* argv[]) {
     CUDA_CHECK(cudaMemset(collision_count, 0, sizeof(std::uint32_t)));
     CUDA_CHECK(cudaMemset(next_active_count, 0, sizeof(std::uint32_t)));
 
-    constexpr int threads_per_block = 256;
     const int blocks = static_cast<int>(
-        (particle_count + threads_per_block - 1) / threads_per_block
+        (particle_count + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK
     );
 
-    initialize_rng_kernel<<<blocks, threads_per_block>>>(
+    initialize_rng_kernel<<<blocks, THREADS_PER_BLOCK>>>(
         rng_states,
         particle_count,
         12345ULL
@@ -602,7 +710,7 @@ int main(int argc, char* argv[]) {
 
     mcm::timer::record_initialization_end();
 
-    initialize_particles_kernel<<<blocks, threads_per_block>>>(
+    initialize_particles_kernel<<<blocks, THREADS_PER_BLOCK>>>(
         particles,
         active_queue,
         rng_states,
@@ -611,7 +719,6 @@ int main(int argc, char* argv[]) {
     );
 
     CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaDeviceSynchronize());
 
     while (active_count_host > 0 && iteration < max_iterations) {
         CUDA_CHECK(cudaMemset(escape_count, 0, sizeof(std::uint32_t)));
@@ -619,10 +726,10 @@ int main(int argc, char* argv[]) {
         CUDA_CHECK(cudaMemset(next_active_count, 0, sizeof(std::uint32_t)));
 
         const int active_blocks = static_cast<int>(
-            (active_count_host + threads_per_block - 1) / threads_per_block
+            (active_count_host + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK
         );
 
-        classify_events_kernel<<<active_blocks, threads_per_block>>>(
+        classify_events_kernel<<<active_blocks, THREADS_PER_BLOCK>>>(
             particles,
             event_data,
             xs_table,
@@ -637,7 +744,6 @@ int main(int argc, char* argv[]) {
         );
 
         CUDA_CHECK(cudaGetLastError());
-        CUDA_CHECK(cudaDeviceSynchronize());
 
         std::uint32_t escape_count_host{};
         std::uint32_t collision_count_host{};
@@ -657,14 +763,14 @@ int main(int argc, char* argv[]) {
         ));
 
         const int escape_blocks = static_cast<int>(
-            (escape_count_host + threads_per_block - 1) / threads_per_block
+            (escape_count_host + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK
         );
         const int collision_blocks = static_cast<int>(
-            (collision_count_host + threads_per_block - 1) / threads_per_block
+            (collision_count_host + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK
         );
 
         if (escape_count_host > 0) {
-            process_escapes_kernel<<<escape_blocks, threads_per_block>>>(
+            process_escapes_kernel<<<escape_blocks, THREADS_PER_BLOCK>>>(
                 particles,
                 event_data,
                 tally,
@@ -674,7 +780,7 @@ int main(int argc, char* argv[]) {
         }
 
         if (collision_count_host > 0) {
-            process_collisions_kernel<<<collision_blocks, threads_per_block>>>(
+            process_collisions_kernel<<<collision_blocks, THREADS_PER_BLOCK>>>(
                 particles,
                 event_data,
                 xs_table,
@@ -688,7 +794,6 @@ int main(int argc, char* argv[]) {
         }
 
         CUDA_CHECK(cudaGetLastError());
-        CUDA_CHECK(cudaDeviceSynchronize());
 
         std::uint32_t next_active_count_host{};
 
@@ -786,6 +891,16 @@ int main(int argc, char* argv[]) {
 
     mcm::timer::print_timing_results(particle_count);
 
+    const double transport_time = mcm::timer::stats.transport_time;
+    const std::uint64_t total_transport_events = total_collisions + total_escaped;
+
+    std::cout << "Collision events per second: "
+        << static_cast<double>(total_collisions) / transport_time
+        << '\n';
+    std::cout << "Transport events per second: "
+        << static_cast<double>(total_transport_events) / transport_time
+        << std::endl;
+
     // === MEMORY CLEANUP ===
 
     CUDA_CHECK(cudaFree(particles.x));
@@ -795,8 +910,7 @@ int main(int argc, char* argv[]) {
     CUDA_CHECK(cudaFree(particles.uy));
     CUDA_CHECK(cudaFree(particles.uz));
     CUDA_CHECK(cudaFree(particles.energy));
-    CUDA_CHECK(cudaFree(particles.status));
-    CUDA_CHECK(cudaFree(particles.collisions));
+    CUDA_CHECK(cudaFree(particles.xs_index));
     CUDA_CHECK(cudaFree(active_queue));
     CUDA_CHECK(cudaFree(escape_queue));
     CUDA_CHECK(cudaFree(collision_queue));
@@ -807,7 +921,6 @@ int main(int argc, char* argv[]) {
     CUDA_CHECK(cudaFree(event_data.collision_distance));
     CUDA_CHECK(cudaFree(event_data.boundary_distance));
     CUDA_CHECK(cudaFree(event_data.xs_a));
-    CUDA_CHECK(cudaFree(event_data.xs_s));
     CUDA_CHECK(cudaFree(event_data.xs_t));
     CUDA_CHECK(cudaFree(xs_table.energies));
     CUDA_CHECK(cudaFree(xs_table.absorption));
