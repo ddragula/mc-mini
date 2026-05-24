@@ -1,3 +1,6 @@
+// Copyright 2026 Dawid Draguła
+// SPDX-License-Identifier: Apache-2.0
+
 #include <iostream>
 
 #include "mc_mini/geometry.hpp"
@@ -83,7 +86,7 @@ namespace mcm {
 int main() {
     mcm::timer::record_start();
 
-    constexpr std::uint64_t particle_count = 10'000'000;
+    constexpr std::uint64_t particle_count = 200'000'000;
 
     mcm::Rng rng(12345);
 

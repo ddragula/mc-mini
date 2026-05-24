@@ -1,3 +1,6 @@
+// Copyright 2026 Dawid Draguła
+// SPDX-License-Identifier: Apache-2.0
+
 #include <cuda_runtime.h>
 #include <curand_kernel.h>
 
@@ -469,7 +472,7 @@ __global__ void process_collisions_kernel(
 int main() {
     mcm::timer::record_start();
 
-    constexpr std::size_t particle_count = 10'000'000;
+    constexpr std::size_t particle_count = 200'000'000;
     constexpr double source_energy = 2.0; // MeV
     const mcm::Material material = mcm::load_ace_material_from_mass_density("data/ace/C0.ACE", 2.26);
 

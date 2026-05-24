@@ -1,3 +1,6 @@
+// Copyright 2026 Dawid Draguła
+// SPDX-License-Identifier: Apache-2.0
+
 #include <chrono>
 #include <iostream>
 
