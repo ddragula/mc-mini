@@ -1,4 +1,4 @@
-.PHONY: debug release runh runc run-debug-history run-release-history run-debug-cuda run-release-cuda h c clean
+.PHONY: debug release runh runhmt runc run-debug-history run-debug-history-mt run-release-history run-release-history-mt run-debug-cuda run-release-cuda hst hmt cuda clean
 
 debug:
 	cmake --preset debug
@@ -9,26 +9,41 @@ release:
 	cmake --build --preset release
 
 run-debug-history: debug
-	./build/debug/mc_history
+	./build/debug/mc_history $(CONFIG)
+
+run-debug-history-mt: debug
+	./build/debug/mc_history_mt $(CONFIG)
 
 run-release-history: release
-	./build/release/mc_history
+	./build/release/mc_history $(CONFIG)
+
+run-release-history-mt: release
+	./build/release/mc_history_mt $(CONFIG)
 
 run-debug-cuda: debug
-	./build/debug/mc_cuda
+	./build/debug/mc_cuda $(CONFIG)
 
 run-release-cuda: release
-	./build/release/mc_cuda
+	./build/release/mc_cuda $(CONFIG)
 
-runh: run-release-history
+runhst: run-release-history
 
-runc: run-release-cuda
+runh: runhst
 
-h:
-	./build/release/mc_history
+runhmt: run-release-history-mt
 
-c:
-	./build/release/mc_cuda
+runcuda: run-release-cuda
+
+runc: runcuda
+
+hst:
+	./build/release/mc_history $(CONFIG)
+
+hmt:
+	./build/release/mc_history_mt $(CONFIG)
+
+cuda:
+	./build/release/mc_cuda $(CONFIG)
 
 clean:
 	rm -rf build

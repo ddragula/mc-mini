@@ -12,6 +12,7 @@
 #include <algorithm>
 
 #include "mc_mini/ace_loader.hpp"
+#include "mc_mini/config.hpp"
 #include "mc_mini/timer.hpp"
 
 #define CUDA_CHECK(call)                                                                \
@@ -469,12 +470,16 @@ __global__ void process_collisions_kernel(
     rng_states[particle_index] = local_state;
 }
 
-int main() {
+int main(int argc, char* argv[]) {
     mcm::timer::record_start();
 
-    constexpr std::size_t particle_count = 10'000'000;
+    const mcm::SimulationConfig config = mcm::load_simulation_config(argc, argv);
+    const std::size_t particle_count = static_cast<std::size_t>(config.particle_count);
     constexpr double source_energy = 2.0; // MeV
-    const mcm::Material material = mcm::load_ace_material_from_mass_density("data/ace/C0.ACE", 2.26);
+    const mcm::Material material = mcm::load_ace_material_from_mass_density(
+        config.material_file,
+        config.mass_density
+    );
 
     curandState* rng_states{};
     CUDA_CHECK(cudaMalloc(&rng_states, particle_count * sizeof(curandState)));
@@ -576,13 +581,14 @@ int main() {
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
 
+    const double box_half_length = 0.5 * config.box_side_length;
     const DeviceBox box{
-        .x_min = -5.0,
-        .y_min = -5.0,
-        .z_min = -5.0,
-        .x_max = 5.0,
-        .y_max = 5.0,
-        .z_max = 5.0
+        .x_min = -box_half_length,
+        .y_min = -box_half_length,
+        .z_min = -box_half_length,
+        .x_max = box_half_length,
+        .y_max = box_half_length,
+        .z_max = box_half_length
     };
 
     std::uint32_t active_count_host = static_cast<std::uint32_t>(particle_count);

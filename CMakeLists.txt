@@ -20,14 +20,27 @@ add_executable(mc_history
     src/history/main.cpp
 )
 
+add_executable(mc_history_mt
+    src/history/main_mt.cpp
+)
+
 add_executable(mc_cuda
     src/cuda/main.cu
 )
 
 target_link_libraries(mc_history PRIVATE mc_common)
+target_link_libraries(mc_history_mt PRIVATE mc_common)
 target_link_libraries(mc_cuda PRIVATE mc_common)
 
 target_compile_options(mc_history PRIVATE
+    -Wall
+    -Wextra
+    -Wpedantic
+    -Wshadow
+    -Wconversion
+)
+
+target_compile_options(mc_history_mt PRIVATE
     -Wall
     -Wextra
     -Wpedantic

@@ -3,99 +3,29 @@
 
 #include <iostream>
 
+#include "mc_mini/config.hpp"
+#include "mc_mini/history/transport.hpp"
 #include "mc_mini/geometry.hpp"
 #include "mc_mini/material.hpp"
-#include "mc_mini/particle.hpp"
 #include "mc_mini/rng.hpp"
 #include "mc_mini/tally.hpp"
-#include "mc_mini/scattering.hpp"
 #include "mc_mini/ace_loader.hpp"
 #include "mc_mini/timer.hpp"
 
-namespace mcm {
-    Particle sample_source_particle(Rng& rng) {
-        Particle particle;
-
-        particle.energy = 2.0; // MeV
-
-        rng.sample_isotropic_direction(
-            particle.ux,
-            particle.uy,
-            particle.uz
-        );
-
-        return particle;
-    }
-
-    void move_particle(Particle& particle, double distance) noexcept {
-        particle.x += distance * particle.ux;
-        particle.y += distance * particle.uy;
-        particle.z += distance * particle.uz;
-    }
-
-    void transport_history(
-        Particle& particle,
-        const Box& box,
-        const Material& material,
-        Rng& rng,
-        Tally& tally
-    ) {
-        tally.source_energy += particle.energy;
-
-        while (particle.is_alive()) {
-            const CrossSections xs = material.cross_sections(particle.energy);
-
-            const double optical_depth = rng.sample_optical_depth();
-            const double collision_distance = optical_depth / xs.t;
-            const double boundary_distance = box.distance_to_boundary(particle);
-
-            if (boundary_distance <= collision_distance) {
-                tally.score_track_length(boundary_distance);
-                move_particle(particle, boundary_distance);
-
-                particle.status = ParticleStatus::escaped;
-                tally.escaped += 1;
-                tally.escaped_energy += particle.energy;
-
-                return;
-            }
-
-            tally.score_track_length(collision_distance);
-            move_particle(particle, collision_distance);
-
-            ++particle.collisions;
-            ++tally.collisions;
-
-            if (rng.uniform01() < xs.a / xs.t) {
-                particle.status = ParticleStatus::absorbed;
-                tally.absorbed += 1;
-                tally.absorbed_energy += particle.energy;
-
-                return;
-            }
-
-            const double energy_before_scattering = particle.energy;
-
-            scatter_elastic_isotropic_cm(particle, material, rng);
-
-            tally.recoil_energy += energy_before_scattering - particle.energy;
-        }
-    }
-}
-
-int main() {
+int main(int argc, char* argv[]) {
     mcm::timer::record_start();
 
-    constexpr std::uint64_t particle_count = 10'000'000;
+    const mcm::SimulationConfig config = mcm::load_simulation_config(argc, argv);
+    const std::uint64_t particle_count = config.particle_count;
 
     mcm::Rng rng(12345);
 
-    const mcm::Box box{
-        .x_min = -5.0, .y_min = -5.0, .z_min = -5.0,
-        .x_max = 5.0, .y_max = 5.0, .z_max = 5.0
-    };
+    const mcm::Box box = config.make_centered_box();
 
-    const mcm::Material material = mcm::load_ace_material_from_mass_density("data/ace/C0.ACE", 2.26);
+    const mcm::Material material = mcm::load_ace_material_from_mass_density(
+        config.material_file,
+        config.mass_density
+    );
 
     mcm::Tally tally{};
 
